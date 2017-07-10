@@ -4,6 +4,8 @@
  *  Copyright 2015 LIFX
  *
  */
+include 'localization'
+
 definition(
 		name: "LIFX (Connect)",
 		namespace: "smartthings",
@@ -17,8 +19,15 @@ definition(
 		singleInstance: true) {
 	appSetting "clientId"
 	appSetting "clientSecret"
+	appSetting "serverUrl" // See note below
 }
 
+// NOTE regarding OAuth settings. On NA01 (i.e. graph.api), NA01S, and NA01D the serverUrl app setting can be left
+// Blank. For other shards is should be set to the callback URL registered with LIFX, which is:
+//
+// Production  -- https://graph.api.smartthings.com
+// Staging     -- https://graph-na01s-useast1.smartthingsgdev.com
+// Development -- https://graph-na01d-useast1.smartthingsgdev.com
 
 preferences {
 	page(name: "Credentials", title: "LIFX", content: "authPage", install: true)
@@ -33,11 +42,12 @@ mappings {
 	path("/test") { action: [ GET: "oauthSuccess" ] }
 }
 
-def getServerUrl()               { return "https://graph.api.smartthings.com" }
-def getCallbackUrl()             { return "https://graph.api.smartthings.com/oauth/callback"}
+def getServerUrl()               { return  appSettings.serverUrl ?: apiServerUrl }
+def getCallbackUrl()             { return "${getServerUrl()}/oauth/callback" }
 def apiURL(path = '/') 			 { return "https://api.lifx.com/v1${path}" }
 def getSecretKey()               { return appSettings.secretKey }
 def getClientId()                { return appSettings.clientId }
+private getVendorName() { "LIFX" }
 
 def authPage() {
 	log.debug "authPage test1"
@@ -62,11 +72,12 @@ def authPage() {
 		log.debug "have LIFX access token"
 
 		def options = locationOptions() ?: []
-		def count = options.size()
+		def count = options.size().toString()
 
 		return dynamicPage(name:"Credentials", title:"", nextPage:"", install:true, uninstall: true) {
 			section("Select your location") {
-				input "selectedLocationId", "enum", required:true, title:"Select location (${count} found)", multiple:false, options:options, submitOnChange: true
+				input "selectedLocationId", "enum", required:true, title:"Select location ({{count}} found)", messageArgs: [count: count], multiple:false, options:options, submitOnChange: true
+				paragraph "Devices will be added automatically from your ${vendorName} account. To add or delete devices please use the Official ${vendorName} App."
 			}
 		}
 	}
@@ -346,7 +357,7 @@ def devicesList(selector = '') {
 		if (resp.status == 200) {
 			return resp.data
 		} else {
-			log.error("Non-200 from device list call. ${resp.status} ${resp.data}")
+			log.debug("No response from device list call. ${resp.status} ${resp.data}")
 			return []
 		}
 	}
@@ -381,38 +392,28 @@ def updateDevices() {
 		selectors.add("${device.id}")
 		if (!childDevice) {
 			// log.info("Adding device ${device.id}: ${device.product}")
-			def data = [
-					label: device.label,
-					level: Math.round((device.brightness ?: 1) * 100),
-					switch: device.power,
-					colorTemperature: device.color.kelvin
-			]
 			if (device.product.capabilities.has_color) {
-				data["color"] = colorUtil.hslToHex((device.color.hue / 3.6) as int, (device.color.saturation * 100) as int)
-				data["hue"] = device.color.hue / 3.6
-				data["saturation"] = device.color.saturation * 100
-				childDevice = addChildDevice(app.namespace, "LIFX Color Bulb", device.id, null, data)
+				childDevice = addChildDevice(app.namespace, "LIFX Color Bulb", device.id, null, ["label": device.label, "completedSetup": true])
 			} else {
-				childDevice = addChildDevice(app.namespace, "LIFX White Bulb", device.id, null, data)
+				childDevice = addChildDevice(app.namespace, "LIFX White Bulb", device.id, null, ["label": device.label, "completedSetup": true])
 			}
-			childDevice?.completedSetup = true
-		} else {
-			if (device.product.capabilities.has_color) {
-				sendEvent(name: "color", value: colorUtil.hslToHex((device.color.hue / 3.6) as int, (device.color.saturation * 100) as int))
-				sendEvent(name: "hue", value: device.color.hue / 3.6)
-				sendEvent(name: "saturation", value: device.color.saturation * 100)
-			}
-			childDevice.sendEvent(name: "label", value: device.label)
-			childDevice.sendEvent(name: "level", value: Math.round((device.brightness ?: 1) * 100))
-			childDevice.sendEvent(name: "switch.setLevel", value: Math.round((device.brightness ?: 1) * 100))
-			childDevice.sendEvent(name: "switch", value: device.power)
-			childDevice.sendEvent(name: "colorTemperature", value: device.color.kelvin)
-			childDevice.sendEvent(name: "model", value: device.product.name)
 		}
+
+		if (device.product.capabilities.has_color) {
+			childDevice.sendEvent(name: "color", value: colorUtil.hslToHex((device.color.hue / 3.6) as int, (device.color.saturation * 100) as int))
+			childDevice.sendEvent(name: "hue", value: device.color.hue / 3.6)
+			childDevice.sendEvent(name: "saturation", value: device.color.saturation * 100)
+		}
+		childDevice.sendEvent(name: "label", value: device.label)
+		childDevice.sendEvent(name: "level", value: Math.round((device.brightness ?: 1) * 100))
+		childDevice.sendEvent(name: "switch.setLevel", value: Math.round((device.brightness ?: 1) * 100))
+		childDevice.sendEvent(name: "switch", value: device.power)
+		childDevice.sendEvent(name: "colorTemperature", value: device.color.kelvin)
+		childDevice.sendEvent(name: "model", value: device.product.name)
 
 		if (state.devices[device.id] == null) {
 			// State missing, add it and set it to opposite status as current status to provoke event below
-			state.devices[device.id] = [online : !device.connected]
+			state.devices[device.id] = [online: !device.connected]
 		}
 
 		if (!state.devices[device.id]?.online && device.connected) {
@@ -428,9 +429,15 @@ def updateDevices() {
 	}
 	getChildDevices().findAll { !selectors.contains("${it.deviceNetworkId}") }.each {
 		log.info("Deleting ${it.deviceNetworkId}")
-		state.devices[it.deviceNetworkId] = null
-		deleteChildDevice(it.deviceNetworkId)
+		if (state.devices[it.deviceNetworkId])
+			state.devices[it.deviceNetworkId] = null
+		// The reason the implementation is trying to delete this bulb is because it is not longer connected to the LIFX location.
+		// Adding "try" will prevent this exception from happening.
+		// Ideally device health would show to the user that the device is not longer accessible so that the user can either force delete it or remove it from the SmartApp.
+		try {
+			deleteChildDevice(it.deviceNetworkId)
+		} catch (Exception e) {
+			log.debug("Can't remove this device because it's being used by an SmartApp")
+		}
 	}
 }
-
-
